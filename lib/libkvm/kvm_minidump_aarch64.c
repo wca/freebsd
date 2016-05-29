@@ -52,6 +52,7 @@ struct vmstate {
 	struct minidumphdr hdr;
 	struct hpt hpt;
 	uint64_t *page_map;
+	uint64_t *bitmap;
 };
 
 static int
@@ -68,7 +69,8 @@ _aarch64_minidump_freevtop(kvm_t *kd)
 	struct vmstate *vm = kd->vmst;
 
 	_kvm_hpt_free(&vm->hpt);
-	free(vm->page_map);
+	_kvm_unmap(vm->page_map, vm->hdr.pmapsize);
+	_kvm_unmap(vm->bitmap, vm->hdr.bitmapsize);
 	free(vm);
 	kd->vmst = NULL;
 }
@@ -77,7 +79,6 @@ static int
 _aarch64_minidump_initvtop(kvm_t *kd)
 {
 	struct vmstate *vmst;
-	uint64_t *bitmap;
 	off_t off;
 
 	vmst = _kvm_malloc(kd, sizeof(*vmst));
@@ -114,50 +115,24 @@ _aarch64_minidump_initvtop(kvm_t *kd)
 	/* Skip header and msgbuf */
 	off = AARCH64_PAGE_SIZE + aarch64_round_page(vmst->hdr.msgbufsize);
 
-	bitmap = _kvm_malloc(kd, vmst->hdr.bitmapsize);
-	if (bitmap == NULL) {
-		_kvm_err(kd, kd->program,
-		    "cannot allocate %d bytes for bitmap",
+	if (_kvm_map(kd, vmst->hdr.bitmapsize, off, (void **)&vmst->bitmap) == -1) {
+		_kvm_err(kd, kd->program, "cannot map %d bytes for bitmap",
 		    vmst->hdr.bitmapsize);
-		return (-1);
-	}
-	if (pread(kd->pmfd, bitmap, vmst->hdr.bitmapsize, off) !=
-	    (ssize_t)vmst->hdr.bitmapsize) {
-		_kvm_err(kd, kd->program,
-		    "cannot read %d bytes for page bitmap",
-		    vmst->hdr.bitmapsize);
-		free(bitmap);
 		return (-1);
 	}
 	off += aarch64_round_page(vmst->hdr.bitmapsize);
 
-	vmst->page_map = _kvm_malloc(kd, vmst->hdr.pmapsize);
-	if (vmst->page_map == NULL) {
-		_kvm_err(kd, kd->program,
-		    "cannot allocate %d bytes for page_map",
+	if (_kvm_map(kd, vmst->hdr.pmapsize, off, (void **)&vmst->page_map) == -1) {
+		_kvm_err(kd, kd->program, "cannot map %d bytes for page_map",
 		    vmst->hdr.pmapsize);
-		free(bitmap);
-		return (-1);
-	}
-	/* This is the end of the dump, savecore may have truncated it. */
-	/*
-	 * XXX: This doesn't make sense.  The pmap is not at the end,
-	 * and if it is truncated we don't have any actual data (it's
-	 * all stored after the bitmap and pmap.  -- jhb
-	 */
-	if (pread(kd->pmfd, vmst->page_map, vmst->hdr.pmapsize, off) <
-	    AARCH64_PAGE_SIZE) {
-		_kvm_err(kd, kd->program, "cannot read %d bytes for page_map",
-		    vmst->hdr.pmapsize);
-		free(bitmap);
+		_kvm_unmap(vmst->bitmap, vmst->hdr.bitmapsize);
 		return (-1);
 	}
 	off += vmst->hdr.pmapsize;
 
 	/* build physical address hash table for sparse pages */
-	_kvm_hpt_init(kd, &vmst->hpt, bitmap, vmst->hdr.bitmapsize, off,
-	    AARCH64_PAGE_SIZE, sizeof(*bitmap));
-	free(bitmap);
+	_kvm_hpt_init(kd, &vmst->hpt, vmst->bitmap, vmst->hdr.bitmapsize, off,
+	    AARCH64_PAGE_SIZE, sizeof(*vmst->bitmap));
 
 	return (0);
 }

@@ -53,6 +53,7 @@ struct vmstate {
 	struct		minidumphdr hdr;
 	struct		hpt hpt;
 	void		*ptemap;
+	uint64_t	*bitmap;
 	unsigned char	ei_data;
 };
 
@@ -70,8 +71,8 @@ _arm_minidump_freevtop(kvm_t *kd)
 	struct vmstate *vm = kd->vmst;
 
 	_kvm_hpt_free(&vm->hpt);
-	if (vm->ptemap)
-		free(vm->ptemap);
+	_kvm_unmap(vm->ptemap, vm->hdr.ptesize);
+	_kvm_unmap(vm->bitmap, vm->hdr.bitmapsize);
 	free(vm);
 	kd->vmst = NULL;
 }
@@ -80,7 +81,6 @@ static int
 _arm_minidump_initvtop(kvm_t *kd)
 {
 	struct vmstate *vmst;
-	uint32_t *bitmap;
 	off_t off;
 
 	vmst = _kvm_malloc(kd, sizeof(*vmst));
@@ -122,44 +122,23 @@ _arm_minidump_initvtop(kvm_t *kd)
 	/* Skip header and msgbuf */
 	off = ARM_PAGE_SIZE + arm_round_page(vmst->hdr.msgbufsize);
 
-	bitmap = _kvm_malloc(kd, vmst->hdr.bitmapsize);
-	if (bitmap == NULL) {
-		_kvm_err(kd, kd->program, "cannot allocate %d bytes for "
-		    "bitmap", vmst->hdr.bitmapsize);
-		return (-1);
-	}
-
-	if (pread(kd->pmfd, bitmap, vmst->hdr.bitmapsize, off) !=
-	    (ssize_t)vmst->hdr.bitmapsize) {
-		_kvm_err(kd, kd->program, "cannot read %d bytes for page bitmap",
+	if (_kvm_map(kd, vmst->hdr.bitmapsize, off, (void **)&vmst->bitmap) == -1) {
+		_kvm_err(kd, kd->program, "cannot map %d bytes for bitmap",
 		    vmst->hdr.bitmapsize);
-		free(bitmap);
 		return (-1);
 	}
 	off += arm_round_page(vmst->hdr.bitmapsize);
 
-	vmst->ptemap = _kvm_malloc(kd, vmst->hdr.ptesize);
-	if (vmst->ptemap == NULL) {
-		_kvm_err(kd, kd->program, "cannot allocate %d bytes for "
-		    "ptemap", vmst->hdr.ptesize);
-		free(bitmap);
-		return (-1);
-	}
-
-	if (pread(kd->pmfd, vmst->ptemap, vmst->hdr.ptesize, off) !=
-	    (ssize_t)vmst->hdr.ptesize) {
-		_kvm_err(kd, kd->program, "cannot read %d bytes for ptemap",
+	if (_kvm_map(kd, vmst->hdr.ptesize, off, (void **)&vmst->ptemap) == -1) {
+		_kvm_err(kd, kd->program, "cannot map %d bytes for ptemap",
 		    vmst->hdr.ptesize);
-		free(bitmap);
 		return (-1);
 	}
-
 	off += vmst->hdr.ptesize;
 
 	/* Build physical address hash table for sparse pages */
-	_kvm_hpt_init(kd, &vmst->hpt, bitmap, vmst->hdr.bitmapsize, off,
-	    ARM_PAGE_SIZE, sizeof(*bitmap));
-	free(bitmap);
+	_kvm_hpt_init(kd, &vmst->hpt, vmst->bitmap, vmst->hdr.bitmapsize, off,
+	    ARM_PAGE_SIZE, sizeof(*vmst->bitmap));
 
 	return (0);
 }

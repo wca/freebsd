@@ -51,6 +51,7 @@ struct vmstate {
 	struct minidumphdr hdr;
 	struct hpt hpt;
 	amd64_pte_t *page_map;
+	uint64_t *bitmap;
 };
 
 static int
@@ -67,8 +68,8 @@ _amd64_minidump_freevtop(kvm_t *kd)
 	struct vmstate *vm = kd->vmst;
 
 	_kvm_hpt_free(&vm->hpt);
-	if (vm->page_map)
-		free(vm->page_map);
+	_kvm_unmap(vm->page_map, vm->hdr.pmapsize);
+	_kvm_unmap(vm->bitmap, vm->hdr.bitmapsize);
 	free(vm);
 	kd->vmst = NULL;
 }
@@ -77,7 +78,6 @@ static int
 _amd64_minidump_initvtop(kvm_t *kd)
 {
 	struct vmstate *vmst;
-	uint64_t *bitmap;
 	off_t off;
 
 	vmst = _kvm_malloc(kd, sizeof(*vmst));
@@ -116,37 +116,23 @@ _amd64_minidump_initvtop(kvm_t *kd)
 	/* Skip header and msgbuf */
 	off = AMD64_PAGE_SIZE + amd64_round_page(vmst->hdr.msgbufsize);
 
-	bitmap = _kvm_malloc(kd, vmst->hdr.bitmapsize);
-	if (bitmap == NULL) {
-		_kvm_err(kd, kd->program, "cannot allocate %d bytes for bitmap", vmst->hdr.bitmapsize);
-		return (-1);
-	}
-	if (pread(kd->pmfd, bitmap, vmst->hdr.bitmapsize, off) !=
-	    (ssize_t)vmst->hdr.bitmapsize) {
-		_kvm_err(kd, kd->program, "cannot read %d bytes for page bitmap", vmst->hdr.bitmapsize);
-		free(bitmap);
+	if (_kvm_map(kd, vmst->hdr.bitmapsize, off, (void **)&vmst->bitmap) == -1) {
+		_kvm_err(kd, kd->program, "cannot map %d bytes for bitmap",
+		    vmst->hdr.bitmapsize);
 		return (-1);
 	}
 	off += amd64_round_page(vmst->hdr.bitmapsize);
 
-	vmst->page_map = _kvm_malloc(kd, vmst->hdr.pmapsize);
-	if (vmst->page_map == NULL) {
-		_kvm_err(kd, kd->program, "cannot allocate %d bytes for page_map", vmst->hdr.pmapsize);
-		free(bitmap);
-		return (-1);
-	}
-	if (pread(kd->pmfd, vmst->page_map, vmst->hdr.pmapsize, off) !=
-	    (ssize_t)vmst->hdr.pmapsize) {
-		_kvm_err(kd, kd->program, "cannot read %d bytes for page_map", vmst->hdr.pmapsize);
-		free(bitmap);
+	if (_kvm_map(kd, vmst->hdr.pmapsize, off, (void **)&vmst->page_map) == -1) {
+		_kvm_err(kd, kd->program, "cannot map %d bytes for page_map",
+		    vmst->hdr.pmapsize);
 		return (-1);
 	}
 	off += vmst->hdr.pmapsize;
 
 	/* build physical address hash table for sparse pages */
-	_kvm_hpt_init(kd, &vmst->hpt, bitmap, vmst->hdr.bitmapsize, off,
-	    AMD64_PAGE_SIZE, sizeof(*bitmap));
-	free(bitmap);
+	_kvm_hpt_init(kd, &vmst->hpt, vmst->bitmap, vmst->hdr.bitmapsize, off,
+	    AMD64_PAGE_SIZE, sizeof(*vmst->bitmap));
 
 	return (0);
 }
@@ -243,8 +229,7 @@ _amd64_minidump_vatop(kvm_t *kd, kvaddr_t va, off_t *pa)
 				goto invalid;
 			}
 			/* TODO: Just read the single PTE */
-			if (pread(kd->pmfd, &pt, AMD64_PAGE_SIZE, ofs) !=
-			    AMD64_PAGE_SIZE) {
+			if (_kvm_pt_read(kd, ofs, AMD64_PAGE_SIZE, pt) == -1) {
 				_kvm_err(kd, kd->program,
 				    "cannot read %d bytes for page table",
 				    AMD64_PAGE_SIZE);

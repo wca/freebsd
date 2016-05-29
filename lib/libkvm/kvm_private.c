@@ -57,6 +57,8 @@ __FBSDID("$FreeBSD$");
 #include <unistd.h>
 #include <stdarg.h>
 
+#include <sys/mman.h>
+
 #include "kvm_private.h"
 
 /*
@@ -120,6 +122,24 @@ _kvm_malloc(kvm_t *kd, size_t n)
 		_kvm_err(kd, kd->program, "can't allocate %zu bytes: %s",
 			 n, strerror(errno));
 	return (p);
+}
+
+int
+_kvm_map(kvm_t *kd, size_t len, off_t off, void **addrp)
+{
+	void *addr;
+
+	addr = mmap(NULL, len, PROT_READ, 0, kd->pmfd, off);
+	if (addr == MAP_FAILED)
+		return (-1);
+	*addrp = addr;
+	return (0);
+}
+
+void
+_kvm_unmap(void *addr, size_t len)
+{
+	(void) munmap(addr, len);
 }
 
 int
@@ -280,6 +300,17 @@ _kvm_hpt_free(struct hpt *hpt)
 			free(hpte);
 		}
 	}
+}
+
+int
+_kvm_pt_read(kvm_t *kd, off_t off, size_t size, void *buf)
+{
+	ssize_t r;
+
+	r = pread(kd->pmfd, buf, size, off);
+	if (r < 0 || size != (size_t)r)
+		return (-1);
+	return (0);
 }
 
 static int

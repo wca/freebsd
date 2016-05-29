@@ -157,3 +157,7 @@ int	 _kvm_read_core_phdrs(kvm_t *, size_t *, GElf_Phdr **);
 void	 _kvm_hpt_init(kvm_t *, struct hpt *, void *, size_t, off_t, int, int);
 off_t	 _kvm_hpt_find(struct hpt *, uint64_t);
 void	 _kvm_hpt_free(struct hpt *);
+
+int	_kvm_map(kvm_t *, size_t, off_t, void **);
+void	_kvm_unmap(void *, size_t);
+int	_kvm_pt_read(kvm_t *, off_t, size_t, void *);

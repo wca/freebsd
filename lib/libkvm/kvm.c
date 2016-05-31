@@ -283,6 +283,8 @@ kvm_close(kvm_t *kd)
 		free((void *) kd->argspc);
 	if (kd->argv != 0)
 		free((void *)kd->argv);
+	if (kd->pt_map != NULL)
+		_kvm_unmap(kd->pt_map, kd->pt_map_size);
 	free((void *)kd);
 
 	return (0);

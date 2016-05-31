@@ -49,9 +49,7 @@ __FBSDID("$FreeBSD$");
 
 struct vmstate {
 	struct minidumphdr hdr;
-	struct hpt hpt;
 	amd64_pte_t *page_map;
-	uint64_t *bitmap;
 };
 
 static int
@@ -67,9 +65,7 @@ _amd64_minidump_freevtop(kvm_t *kd)
 {
 	struct vmstate *vm = kd->vmst;
 
-	_kvm_hpt_free(&vm->hpt);
 	_kvm_unmap(vm->page_map, vm->hdr.pmapsize);
-	_kvm_unmap(vm->bitmap, vm->hdr.bitmapsize);
 	free(vm);
 	kd->vmst = NULL;
 }
@@ -78,7 +74,7 @@ static int
 _amd64_minidump_initvtop(kvm_t *kd)
 {
 	struct vmstate *vmst;
-	off_t off;
+	off_t off, sparse_off;
 
 	vmst = _kvm_malloc(kd, sizeof(*vmst));
 	if (vmst == NULL) {
@@ -116,9 +112,11 @@ _amd64_minidump_initvtop(kvm_t *kd)
 	/* Skip header and msgbuf */
 	off = AMD64_PAGE_SIZE + amd64_round_page(vmst->hdr.msgbufsize);
 
-	if (_kvm_map(kd, vmst->hdr.bitmapsize, off, (void **)&vmst->bitmap) == -1) {
-		_kvm_err(kd, kd->program, "cannot map %d bytes for bitmap",
-		    vmst->hdr.bitmapsize);
+	sparse_off = off + amd64_round_page(vmst->hdr.bitmapsize) +
+	    amd64_round_page(vmst->hdr.pmapsize);
+	if (_kvm_pt_init(kd, vmst->hdr.bitmapsize, off, sparse_off,
+	    AMD64_PAGE_SIZE, sizeof(uint64_t)) == -1) {
+		_kvm_err(kd, kd->program, "cannot load core bitmap");
 		return (-1);
 	}
 	off += amd64_round_page(vmst->hdr.bitmapsize);
@@ -128,11 +126,7 @@ _amd64_minidump_initvtop(kvm_t *kd)
 		    vmst->hdr.pmapsize);
 		return (-1);
 	}
-	off += vmst->hdr.pmapsize;
-
-	/* build physical address hash table for sparse pages */
-	_kvm_hpt_init(kd, &vmst->hpt, vmst->bitmap, vmst->hdr.bitmapsize, off,
-	    AMD64_PAGE_SIZE, sizeof(*vmst->bitmap));
+	off += amd64_round_page(vmst->hdr.pmapsize);
 
 	return (0);
 }
@@ -161,7 +155,7 @@ _amd64_minidump_vatop_v1(kvm_t *kd, kvaddr_t va, off_t *pa)
 			goto invalid;
 		}
 		a = pte & AMD64_PG_FRAME;
-		ofs = _kvm_hpt_find(&vm->hpt, a);
+		ofs = _kvm_pt_find(kd, a);
 		if (ofs == -1) {
 			_kvm_err(kd, kd->program,
 	    "_amd64_minidump_vatop_v1: physical address 0x%jx not in minidump",
@@ -172,7 +166,7 @@ _amd64_minidump_vatop_v1(kvm_t *kd, kvaddr_t va, off_t *pa)
 		return (AMD64_PAGE_SIZE - offset);
 	} else if (va >= vm->hdr.dmapbase && va < vm->hdr.dmapend) {
 		a = (va - vm->hdr.dmapbase) & ~AMD64_PAGE_MASK;
-		ofs = _kvm_hpt_find(&vm->hpt, a);
+		ofs = _kvm_pt_find(kd, a);
 		if (ofs == -1) {
 			_kvm_err(kd, kd->program,
     "_amd64_minidump_vatop_v1: direct map address 0x%jx not in minidump",
@@ -221,19 +215,12 @@ _amd64_minidump_vatop(kvm_t *kd, kvaddr_t va, off_t *pa)
 		}
 		if ((pde & AMD64_PG_PS) == 0) {
 			a = pde & AMD64_PG_FRAME;
-			ofs = _kvm_hpt_find(&vm->hpt, a);
-			if (ofs == -1) {
-				_kvm_err(kd, kd->program,
-	    "_amd64_minidump_vatop: pt physical address 0x%jx not in minidump",
-				    (uintmax_t)a);
-				goto invalid;
-			}
 			/* TODO: Just read the single PTE */
-			if (_kvm_pt_read(kd, ofs, AMD64_PAGE_SIZE, pt) == -1) {
+			if (_kvm_pt_read(kd, a, AMD64_PAGE_SIZE, pt) == -1) {
 				_kvm_err(kd, kd->program,
 				    "cannot read %d bytes for page table",
 				    AMD64_PAGE_SIZE);
-				return (-1);
+				goto invalid;
 			}
 			pteindex = (va >> AMD64_PAGE_SHIFT) &
 			    (AMD64_NPTEPG - 1);
@@ -248,7 +235,7 @@ _amd64_minidump_vatop(kvm_t *kd, kvaddr_t va, off_t *pa)
 			a = pde & AMD64_PG_PS_FRAME;
 			a += (va & AMD64_PDRMASK) ^ offset;
 		}
-		ofs = _kvm_hpt_find(&vm->hpt, a);
+		ofs = _kvm_pt_find(kd, a);
 		if (ofs == -1) {
 			_kvm_err(kd, kd->program,
 	    "_amd64_minidump_vatop: physical address 0x%jx not in minidump",
@@ -259,7 +246,7 @@ _amd64_minidump_vatop(kvm_t *kd, kvaddr_t va, off_t *pa)
 		return (AMD64_PAGE_SIZE - offset);
 	} else if (va >= vm->hdr.dmapbase && va < vm->hdr.dmapend) {
 		a = (va - vm->hdr.dmapbase) & ~AMD64_PAGE_MASK;
-		ofs = _kvm_hpt_find(&vm->hpt, a);
+		ofs = _kvm_pt_find(kd, a);
 		if (ofs == -1) {
 			_kvm_err(kd, kd->program,
 	    "_amd64_minidump_vatop: direct map address 0x%jx not in minidump",

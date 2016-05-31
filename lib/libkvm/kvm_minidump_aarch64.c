@@ -50,9 +50,7 @@ __FBSDID("$FreeBSD$");
 
 struct vmstate {
 	struct minidumphdr hdr;
-	struct hpt hpt;
 	uint64_t *page_map;
-	uint64_t *bitmap;
 };
 
 static int
@@ -68,9 +66,7 @@ _aarch64_minidump_freevtop(kvm_t *kd)
 {
 	struct vmstate *vm = kd->vmst;
 
-	_kvm_hpt_free(&vm->hpt);
 	_kvm_unmap(vm->page_map, vm->hdr.pmapsize);
-	_kvm_unmap(vm->bitmap, vm->hdr.bitmapsize);
 	free(vm);
 	kd->vmst = NULL;
 }
@@ -79,7 +75,7 @@ static int
 _aarch64_minidump_initvtop(kvm_t *kd)
 {
 	struct vmstate *vmst;
-	off_t off;
+	off_t off, sparse_off;
 
 	vmst = _kvm_malloc(kd, sizeof(*vmst));
 	if (vmst == NULL) {
@@ -115,9 +111,12 @@ _aarch64_minidump_initvtop(kvm_t *kd)
 	/* Skip header and msgbuf */
 	off = AARCH64_PAGE_SIZE + aarch64_round_page(vmst->hdr.msgbufsize);
 
-	if (_kvm_map(kd, vmst->hdr.bitmapsize, off, (void **)&vmst->bitmap) == -1) {
-		_kvm_err(kd, kd->program, "cannot map %d bytes for bitmap",
-		    vmst->hdr.bitmapsize);
+	/* build physical address lookup table for sparse pages */
+	sparse_off = off + aarch64_round_page(vmst->hdr.bitmapsize) +
+	    aarch64_round_page(vmst->hdr.pmapsize);
+	if (_kvm_pt_init(kd, vmst->hdr.bitmapsize, off, sparse_off,
+	    AARCH64_PAGE_SIZE, sizeof(uint64_t)) == -1) {
+		_kvm_err(kd, kd->program, "cannot load core bitmap");
 		return (-1);
 	}
 	off += aarch64_round_page(vmst->hdr.bitmapsize);
@@ -125,14 +124,9 @@ _aarch64_minidump_initvtop(kvm_t *kd)
 	if (_kvm_map(kd, vmst->hdr.pmapsize, off, (void **)&vmst->page_map) == -1) {
 		_kvm_err(kd, kd->program, "cannot map %d bytes for page_map",
 		    vmst->hdr.pmapsize);
-		_kvm_unmap(vmst->bitmap, vmst->hdr.bitmapsize);
 		return (-1);
 	}
-	off += vmst->hdr.pmapsize;
-
-	/* build physical address hash table for sparse pages */
-	_kvm_hpt_init(kd, &vmst->hpt, vmst->bitmap, vmst->hdr.bitmapsize, off,
-	    AARCH64_PAGE_SIZE, sizeof(*vmst->bitmap));
+	off += aarch64_round_page(vmst->hdr.pmapsize);
 
 	return (0);
 }
@@ -153,7 +147,7 @@ _aarch64_minidump_vatop(kvm_t *kd, kvaddr_t va, off_t *pa)
 	if (va >= vm->hdr.dmapbase && va < vm->hdr.dmapend) {
 		a = (va - vm->hdr.dmapbase + vm->hdr.dmapphys) &
 		    ~AARCH64_PAGE_MASK;
-		ofs = _kvm_hpt_find(&vm->hpt, a);
+		ofs = _kvm_pt_find(kd, a);
 		if (ofs == -1) {
 			_kvm_err(kd, kd->program, "_aarch64_minidump_vatop: "
 			    "direct map address 0x%jx not in minidump",
@@ -173,7 +167,7 @@ _aarch64_minidump_vatop(kvm_t *kd, kvaddr_t va, off_t *pa)
 			goto invalid;
 		}
 		a = l3 & ~AARCH64_ATTR_MASK;
-		ofs = _kvm_hpt_find(&vm->hpt, a);
+		ofs = _kvm_pt_find(kd, a);
 		if (ofs == -1) {
 			_kvm_err(kd, kd->program, "_aarch64_minidump_vatop: "
 			    "physical address 0x%jx not in minidump",

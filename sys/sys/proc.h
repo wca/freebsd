@@ -122,6 +122,15 @@ struct pargs {
 	u_char	ar_args[1];	/* Arguments. */
 };
 
+/*
+ * SMR thread state.
+ */
+struct smr_td_state {
+	TAILQ_ENTRY(smr_td_state) ts_entry;
+	struct thread *ts_td;
+	unsigned int ts_recurse;
+};
+
 /*-
  * Description of a process.
  *
@@ -354,6 +363,7 @@ struct thread {
 	int		td_lastcpu;	/* (t) Last cpu we were on. */
 	int		td_oncpu;	/* (t) Which cpu we are on. */
 	void		*td_lkpi_task;	/* LinuxKPI task struct pointer */
+	struct smr_td_state td_smr;	/* Safe memory reclamation state */
 };
 
 struct thread0_storage {

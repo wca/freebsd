@@ -127,7 +127,6 @@ struct pargs {
  */
 struct smr_td_state {
 	TAILQ_ENTRY(smr_td_state) ts_entry;
-	struct thread *ts_td;
 	unsigned int ts_recurse;
 };
 

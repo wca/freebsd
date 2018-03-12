@@ -44,6 +44,9 @@
 
 #include <ck_epoch.h>
 
+#define container_of(p, stype, field) \
+	((stype *)(((uint8_t *)(p)) - offsetof(stype, field)))
+
 struct smr_td_state;
 struct smr_pcpu_state {
 	ck_epoch_record_t sps_record;
@@ -73,13 +76,13 @@ sched_smr(void)
 	tv.tv_sec = 5;
 	tv.tv_usec = 0;
 
-	mtx_lock(&smr_mtx);
 	for (;;) {
 		smr_synchronize_wait();
-		(void) cv_timedwait(&smr_cv, &smr_mtx, tvtohz(&tv));
-	}
 
-	mtx_unlock(&smr_mtx);
+		mtx_lock(&smr_mtx);
+		(void) cv_timedwait(&smr_cv, &smr_mtx, tvtohz(&tv));
+		mtx_unlock(&smr_mtx);
+	}
 }
 
 void
@@ -153,7 +156,6 @@ smr_synchronize_cb(ck_epoch_t *epoch __unused, ck_epoch_record_t *record,
 	struct smr_td_state *ts;
 
 	sps = (struct smr_pcpu_state *)record;
-	td = curthread;
 
 	/* Check if blocked on the current CPU */
 	if (sps->sps_cpuid == PCPU_GET(cpuid)) {
@@ -167,29 +169,30 @@ smr_synchronize_cb(ck_epoch_t *epoch __unused, ck_epoch_record_t *record,
 		 * go anywhere while the current thread is locked.
 		 */
 		TAILQ_FOREACH(ts, &sps->sps_head, ts_entry) {
-			if (ts->ts_td->td_priority > prio)
-				prio = ts->ts_td->td_priority;
-			is_sleeping |= (ts->ts_td->td_inhibitors != 0);
+			td = container_of(ts, struct thread, td_smr);
+			if (td->td_priority > prio)
+				prio = td->td_priority;
+			is_sleeping |= (td->td_inhibitors != 0);
 		}
 
 		if (is_sleeping) {
-			thread_unlock(td);
+			thread_unlock(curthread);
 			pause("W", 1);
-			thread_lock(td);
+			thread_lock(curthread);
 		} else {
 			/* set new thread priority */
-			sched_prio(td, prio);
+			sched_prio(curthread, prio);
 			/* task switch */
 			mi_switch(SW_VOL | SWT_RELINQUISH, NULL);
 
 			/*
 			 * Release the thread lock while yielding to
 			 * allow other threads to acquire the lock
-			 * pointed to by TDQ_LOCKPTR(td). Else a
+			 * pointed to by TDQ_LOCKPTR(curthread). Else a
 			 * deadlock like situation might happen.
 			 */
-			thread_unlock(td);
-			thread_lock(td);
+			thread_unlock(curthread);
+			thread_lock(curthread);
 		}
 	} else {
 		/*
@@ -198,8 +201,8 @@ smr_synchronize_cb(ck_epoch_t *epoch __unused, ck_epoch_record_t *record,
 		 * thread priority so that code gets run. The thread
 		 * priority will be restored later.
 		 */
-		sched_prio(td, 0);
-		sched_bind(td, sps->sps_cpuid);
+		sched_prio(curthread, 0);
+		sched_bind(curthread, sps->sps_cpuid);
 	}
 }
 
@@ -267,9 +270,10 @@ smr_init(void *arg __unused)
 	CPU_FOREACH(i) {
 		sps = &DPCPU_ID_GET(i, smr_state);
 		sps->sps_cpuid = i;
+		TAILQ_INIT(&sps->sps_head);
 		ck_epoch_register(&kern_epoch, &sps->sps_record, NULL);
 	}
 
 	kproc_start(&smr_kp);
 }
-SYSINIT(smr, SI_SUB_CPU, SI_ORDER_ANY, smr_init, NULL);
+SYSINIT(smr, SI_SUB_KTHREAD_INIT, SI_ORDER_ANY, smr_init, NULL);

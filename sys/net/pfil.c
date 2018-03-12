@@ -337,6 +337,7 @@ pfil_remove_hook(pfil_func_t func, void *arg, int flags, struct pfil_head *ph)
 {
 	int err = 0;
 
+	smr_begin();
 	PFIL_WLOCK(ph);
 	if (flags & PFIL_IN) {
 		err = pfil_chain_remove(&ph->ph_in, func, arg);
@@ -349,6 +350,7 @@ pfil_remove_hook(pfil_func_t func, void *arg, int flags, struct pfil_head *ph)
 			ph->ph_nhooks--;
 	}
 	PFIL_WUNLOCK(ph);
+	smr_end();
 	return (err);
 }
 

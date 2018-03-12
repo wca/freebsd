@@ -35,9 +35,28 @@
 
 #include <ck_epoch.h>
 
+#define	SMR_CONTAINER CK_EPOCH_CONTAINER
+typedef ck_epoch_entry_t smr_entry_t;
+typedef ck_epoch_cb_t smr_cb_t;
+
+/**
+ * @brief Begin a SMR read-side section.
+ */
 void smr_begin(void);
+
+/**
+ * @brief End a SMR read-side section.
+ */
 void smr_end(void);
-void smr_call(ck_epoch_entry_t *, ck_epoch_cb_t *);
+
+/**
+ * @brief Call a reclamation callback once the object is no longer reachable.
+ */
+void smr_call(smr_entry_t *, smr_cb_t *);
+
+/**
+ * @brief Wait until all currently-unreachable objects are reclaimed.
+ */
 void smr_synchronize_wait(void);
 
 #endif /* _SYS_CALLOUT_H_ */

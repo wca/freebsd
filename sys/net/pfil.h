@@ -40,7 +40,11 @@
 #include <sys/_mutex.h>
 #include <sys/lock.h>
 #include <sys/rmlock.h>
+#include <sys/smr.h>
 #include <net/vnet.h>
+
+#include <ck_epoch.h>
+#include <ck_queue.h>
 
 struct mbuf;
 struct ifnet;
@@ -55,9 +59,10 @@ typedef	int	(*pfil_func_t)(void *, struct mbuf **, struct ifnet *, int,
  * together and after each other in the specified order.
  */
 struct packet_filter_hook {
-	TAILQ_ENTRY(packet_filter_hook) pfil_chain;
+	CK_STAILQ_ENTRY(packet_filter_hook) pfil_chain;
 	pfil_func_t	 pfil_func;
 	void		*pfil_arg;
+	smr_entry_t	pfil_smr;
 };
 
 #define PFIL_IN		0x00000001
@@ -65,7 +70,7 @@ struct packet_filter_hook {
 #define PFIL_WAITOK	0x00000004
 #define PFIL_ALL	(PFIL_IN|PFIL_OUT)
 
-typedef	TAILQ_HEAD(pfil_chain, packet_filter_hook) pfil_chain_t;
+typedef CK_STAILQ_HEAD(pfil_chain, packet_filter_hook) pfil_chain_t;
 
 #define	PFIL_TYPE_AF		1	/* key is AF_* type */
 #define	PFIL_TYPE_IFNET		2	/* key is ifnet pointer */

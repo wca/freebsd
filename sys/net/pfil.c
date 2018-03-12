@@ -59,6 +59,8 @@ static struct packet_filter_hook *pfil_chain_get(int, struct pfil_head *);
 static int pfil_chain_add(pfil_chain_t *, struct packet_filter_hook *, int);
 static int pfil_chain_remove(pfil_chain_t *, pfil_func_t, void *);
 
+SMR_CONTAINER(struct packet_filter_hook, pfil_smr, pfh_smr_container);
+
 LIST_HEAD(pfilheadhead, pfil_head);
 VNET_DEFINE(struct pfilheadhead, pfil_head_list);
 #define	V_pfil_head_list	VNET(pfil_head_list)
@@ -80,10 +82,7 @@ VNET_DEFINE(struct rmlock, pfil_lock);
 		PFIL_LOCK_DESTROY_REAL((p)->ph_plock);	\
 } while (0)
 
-#define	PFIL_TRY_RLOCK(p, t)	rm_try_rlock((p)->ph_plock, (t))
-#define	PFIL_RLOCK(p, t)	rm_rlock((p)->ph_plock, (t))
 #define	PFIL_WLOCK(p)		rm_wlock((p)->ph_plock)
-#define	PFIL_RUNLOCK(p, t)	rm_runlock((p)->ph_plock, (t))
 #define	PFIL_WUNLOCK(p)		rm_wunlock((p)->ph_plock)
 #define	PFIL_WOWNED(p)		rm_wowned((p)->ph_plock)
 
@@ -102,10 +101,10 @@ pfil_run_hooks(struct pfil_head *ph, struct mbuf **mp, struct ifnet *ifp,
 	struct mbuf *m = *mp;
 	int rv = 0;
 
-	PFIL_RLOCK(ph, &rmpt);
+	pfil_rlock(ph, &rmpt);
 	KASSERT(ph->ph_nhooks >= 0, ("Pfil hook count dropped < 0"));
 	for (pfh = pfil_chain_get(dir, ph); pfh != NULL;
-	     pfh = TAILQ_NEXT(pfh, pfil_chain)) {
+	     pfh = CK_STAILQ_NEXT(pfh, pfil_chain)) {
 		if (pfh->pfil_func != NULL) {
 			rv = (*pfh->pfil_func)(pfh->pfil_arg, &m, ifp, dir,
 			    inp);
@@ -113,7 +112,7 @@ pfil_run_hooks(struct pfil_head *ph, struct mbuf **mp, struct ifnet *ifp,
 				break;
 		}
 	}
-	PFIL_RUNLOCK(ph, &rmpt);
+	pfil_runlock(ph, &rmpt);
 	*mp = m;
 	return (rv);
 }
@@ -123,9 +122,9 @@ pfil_chain_get(int dir, struct pfil_head *ph)
 {
 
 	if (dir == PFIL_IN)
-		return (TAILQ_FIRST(&ph->ph_in));
+		return (CK_STAILQ_FIRST(&ph->ph_in));
 	else if (dir == PFIL_OUT)
-		return (TAILQ_FIRST(&ph->ph_out));
+		return (CK_STAILQ_FIRST(&ph->ph_out));
 	else
 		return (NULL);
 }
@@ -138,7 +137,8 @@ int
 pfil_try_rlock(struct pfil_head *ph, struct rm_priotracker *tracker)
 {
 
-	return (PFIL_TRY_RLOCK(ph, tracker));
+	smr_begin();
+	return (1);
 }
 
 /*
@@ -148,7 +148,7 @@ void
 pfil_rlock(struct pfil_head *ph, struct rm_priotracker *tracker)
 {
 
-	PFIL_RLOCK(ph, tracker);
+	smr_begin();
 }
 
 /*
@@ -158,7 +158,7 @@ void
 pfil_runlock(struct pfil_head *ph, struct rm_priotracker *tracker)
 {
 
-	PFIL_RUNLOCK(ph, tracker);
+	smr_end();
 }
 
 /*
@@ -211,11 +211,19 @@ pfil_head_register(struct pfil_head *ph)
 	}
 	PFIL_LOCK_INIT(ph);
 	ph->ph_nhooks = 0;
-	TAILQ_INIT(&ph->ph_in);
-	TAILQ_INIT(&ph->ph_out);
+	CK_STAILQ_INIT(&ph->ph_in);
+	CK_STAILQ_INIT(&ph->ph_out);
 	LIST_INSERT_HEAD(&V_pfil_head_list, ph, ph_list);
 	PFIL_HEADLIST_UNLOCK();
 	return (0);
+}
+
+static void
+packet_filter_hook_reclaim(smr_entry_t *entry)
+{
+	struct packet_filter_hook *pfh = pfh_smr_container(entry);
+
+	free(pfh, M_IFADDR);
 }
 
 /*
@@ -227,14 +235,16 @@ int
 pfil_head_unregister(struct pfil_head *ph)
 {
 	struct packet_filter_hook *pfh, *pfnext;
-		
+
 	PFIL_HEADLIST_LOCK();
 	LIST_REMOVE(ph, ph_list);
 	PFIL_HEADLIST_UNLOCK();
-	TAILQ_FOREACH_SAFE(pfh, &ph->ph_in, pfil_chain, pfnext)
-		free(pfh, M_IFADDR);
-	TAILQ_FOREACH_SAFE(pfh, &ph->ph_out, pfil_chain, pfnext)
-		free(pfh, M_IFADDR);
+	smr_begin();
+	CK_STAILQ_FOREACH_SAFE(pfh, &ph->ph_in, pfil_chain, pfnext)
+		smr_call(&pfh->pfil_smr, packet_filter_hook_reclaim);
+	CK_STAILQ_FOREACH_SAFE(pfh, &ph->ph_out, pfil_chain, pfnext)
+		smr_call(&pfh->pfil_smr, packet_filter_hook_reclaim);
+	smr_end();
 	PFIL_LOCK_DESTROY(ph);
 	return (0);
 }
@@ -353,7 +363,7 @@ pfil_chain_add(pfil_chain_t *chain, struct packet_filter_hook *pfh1, int flags)
 	/*
 	 * First make sure the hook is not already there.
 	 */
-	TAILQ_FOREACH(pfh, chain, pfil_chain)
+	CK_STAILQ_FOREACH(pfh, chain, pfil_chain)
 		if (pfh->pfil_func == pfh1->pfil_func &&
 		    pfh->pfil_arg == pfh1->pfil_arg)
 			return (EEXIST);
@@ -363,9 +373,9 @@ pfil_chain_add(pfil_chain_t *chain, struct packet_filter_hook *pfh1, int flags)
 	 * the same path is followed in or out of the kernel.
 	 */
 	if (flags & PFIL_IN)
-		TAILQ_INSERT_HEAD(chain, pfh1, pfil_chain);
+		CK_STAILQ_INSERT_HEAD(chain, pfh1, pfil_chain);
 	else
-		TAILQ_INSERT_TAIL(chain, pfh1, pfil_chain);
+		CK_STAILQ_INSERT_TAIL(chain, pfh1, pfil_chain);
 	return (0);
 }
 
@@ -377,10 +387,11 @@ pfil_chain_remove(pfil_chain_t *chain, pfil_func_t func, void *arg)
 {
 	struct packet_filter_hook *pfh;
 
-	TAILQ_FOREACH(pfh, chain, pfil_chain)
+	CK_STAILQ_FOREACH(pfh, chain, pfil_chain)
 		if (pfh->pfil_func == func && pfh->pfil_arg == arg) {
-			TAILQ_REMOVE(chain, pfh, pfil_chain);
-			free(pfh, M_IFADDR);
+			CK_STAILQ_REMOVE(chain, pfh,
+			    packet_filter_hook, pfil_chain);
+			smr_call(&pfh->pfil_smr, packet_filter_hook_reclaim);
 			return (0);
 		}
 	return (ENOENT);

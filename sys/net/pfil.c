@@ -246,6 +246,7 @@ pfil_head_unregister(struct pfil_head *ph)
 		smr_call(&pfh->pfil_smr, packet_filter_hook_reclaim);
 	smr_end();
 	PFIL_LOCK_DESTROY(ph);
+	//smr_barrier(SMR_BARRIER_T_PCPU);
 	return (0);
 }
 
@@ -351,6 +352,7 @@ pfil_remove_hook(pfil_func_t func, void *arg, int flags, struct pfil_head *ph)
 	}
 	PFIL_WUNLOCK(ph);
 	smr_end();
+	//smr_barrier(SMR_BARRIER_T_PCPU);
 	return (err);
 }
 

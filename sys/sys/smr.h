@@ -59,4 +59,13 @@ void smr_call(smr_entry_t *, smr_cb_t *);
  */
 void smr_synchronize_wait(void);
 
+/**
+ * @brief Reclaim currently-unreachable objects for the given CPU.
+ *
+ * @param which		Barrier type to perform.
+ */
+#define	SMR_BARRIER_T_PCPU	(0)
+#define	SMR_BARRIER_T_ALL	(1)
+void smr_barrier(unsigned int which);
+
 #endif /* _SYS_CALLOUT_H_ */

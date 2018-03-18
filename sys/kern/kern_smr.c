@@ -77,7 +77,7 @@ sched_smr(void)
 	tv.tv_usec = 0;
 
 	for (;;) {
-		smr_synchronize_wait();
+		smr_barrier(SMR_BARRIER_T_ALL);
 
 		mtx_lock(&smr_mtx);
 		(void) cv_timedwait(&smr_cv, &smr_mtx, tvtohz(&tv));
@@ -155,7 +155,7 @@ smr_synchronize_cb(ck_epoch_t *epoch __unused, ck_epoch_record_t *record,
 	struct thread *td;
 	struct smr_td_state *ts;
 
-	sps = (struct smr_pcpu_state *)record;
+	sps = container_of(record, struct smr_pcpu_state, sps_record);
 
 	/* Check if blocked on the current CPU */
 	if (sps->sps_cpuid == PCPU_GET(cpuid)) {
@@ -255,6 +255,94 @@ smr_synchronize_wait(void)
 	thread_unlock(td);
 
 	PICKUP_GIANT();
+}
+
+static void
+epoch_record_reclaims(struct ck_epoch_record *record, unsigned int n_reclaims)
+{
+	unsigned int n_peak;
+
+	n_peak = ck_pr_load_uint(&record->n_peak);
+
+	/* We don't require accuracy around peak calculation. */
+	if (n_reclaims > n_peak)
+		ck_pr_store_uint(&record->n_peak, n_peak);
+
+	if (n_reclaims > 0) {
+		ck_pr_add_uint(&record->n_dispatch, n_reclaims);
+		ck_pr_sub_uint(&record->n_pending, n_reclaims);
+	}
+
+	return;
+}
+
+CK_STACK_CONTAINER(struct ck_epoch_entry, stack_entry,
+    ck_epoch_entry_container)
+static void
+epoch_stack_dispatch(ck_stack_t *pending)
+{
+	ck_stack_entry_t *cursor, *next;
+
+	CK_STACK_FOREACH_SAFE(pending, cursor, next) {
+		struct ck_epoch_entry *entry = ck_epoch_entry_container(cursor);
+
+		next = CK_STACK_NEXT(cursor);
+		entry->function(entry);
+	}
+
+	return;
+}
+
+static void
+epoch_stack_pop(struct ck_epoch_record *record, ck_stack_t *pending)
+{
+	unsigned int epoch, reclaims;
+	ck_stack_entry_t *e_pending, *cursor;
+
+	for (epoch = 0; epoch < CK_EPOCH_LENGTH; epoch++) {
+		reclaims = 0;
+		e_pending = ck_stack_batch_pop_upmc(&record->pending[epoch]);
+		if (e_pending == NULL)
+			continue;
+		for (cursor = e_pending; cursor != NULL;
+		    cursor = CK_STACK_NEXT(cursor), reclaims++);
+		epoch_record_reclaims(record, reclaims);
+		ck_stack_push_upmc(pending, e_pending);
+	}
+	return;
+}
+
+void
+smr_barrier(unsigned int which)
+{
+	struct smr_pcpu_state *sps;
+	ck_stack_t pending;
+	int i;
+
+	/*
+	 * Pop off every pending deferred object requested, synchronize,
+	 * then dispatch all seen deferrals.
+	 */
+	ck_stack_init(&pending);
+	switch (which) {
+	case SMR_BARRIER_T_PCPU:
+		sps = &DPCPU_GET(smr_state);
+		epoch_stack_pop(&sps->sps_record, &pending);
+		break;
+	case SMR_BARRIER_T_ALL:
+		CPU_FOREACH(i) {
+			sps = &DPCPU_ID_GET(i, smr_state);
+			epoch_stack_pop(&sps->sps_record, &pending);
+		}
+		break;
+	default:
+		panic("unhandled smr_barrier which case");
+		/* NOTREACHED */
+	}
+
+	smr_synchronize_wait();
+
+	epoch_stack_dispatch(&pending);
 }
 
 static void

@@ -34,6 +34,7 @@
 #include <sys/uio.h>
 #include <sys/ptrace.h>
 #include <sys/rmlock.h>
+#include <sys/smr.h>
 #include <sys/sysent.h>
 
 #define OP(x)	((x) >> 26)
@@ -263,12 +264,11 @@ static void
 fasttrap_return_common(struct reg *rp, uintptr_t pc, pid_t pid,
     uintptr_t new_pc)
 {
-	struct rm_priotracker tracker;
 	fasttrap_tracepoint_t *tp;
 	fasttrap_bucket_t *bucket;
 	fasttrap_id_t *id;
 
-	rm_rlock(&fasttrap_tp_lock, &tracker);
+	smr_begin();
 	bucket = &fasttrap_tpoints.fth_table[FASTTRAP_TPOINTS_INDEX(pid, pc)];
 
 	for (tp = bucket->ftb_data; tp != NULL; tp = tp->ftt_next) {
@@ -283,7 +283,7 @@ fasttrap_return_common(struct reg *rp, uintptr_t pc, pid_t pid,
 	 * is not essential to the correct execution of the process.
 	 */
 	if (tp == NULL) {
-		rm_runlock(&fasttrap_tp_lock, &tracker);
+		smr_end();
 		return;
 	}
 
@@ -301,7 +301,7 @@ fasttrap_return_common(struct reg *rp, uintptr_t pc, pid_t pid,
 		    pc - id->fti_probe->ftp_faddr,
 		    rp->fixreg[3], rp->fixreg[4], 0, 0);
 	}
-	rm_runlock(&fasttrap_tp_lock, &tracker);
+	smr_end();
 }
 
 
@@ -331,7 +331,6 @@ int
 fasttrap_pid_probe(struct trapframe *frame)
 {
 	struct reg reg, *rp;
-	struct rm_priotracker tracker;
 	proc_t *p = curproc;
 	uintptr_t pc;
 	uintptr_t new_pc = 0;
@@ -366,7 +365,7 @@ fasttrap_pid_probe(struct trapframe *frame)
 	curthread->t_dtrace_scrpc = 0;
 	curthread->t_dtrace_astpc = 0;
 
-	rm_rlock(&fasttrap_tp_lock, &tracker);
+	smr_begin();
 	pid = p->p_pid;
 	bucket = &fasttrap_tpoints.fth_table[FASTTRAP_TPOINTS_INDEX(pid, pc)];
 
@@ -385,7 +384,7 @@ fasttrap_pid_probe(struct trapframe *frame)
 	 * fasttrap_ioctl), or somehow we have mislaid this tracepoint.
 	 */
 	if (tp == NULL) {
-		rm_runlock(&fasttrap_tp_lock, &tracker);
+		smr_end();
 		return (-1);
 	}
 
@@ -439,7 +438,7 @@ fasttrap_pid_probe(struct trapframe *frame)
 	 * tracepoint again later if we need to light up any return probes.
 	 */
 	tp_local = *tp;
-	rm_runlock(&fasttrap_tp_lock, &tracker);
+	smr_end();
 	tp = &tp_local;
 
 	/*

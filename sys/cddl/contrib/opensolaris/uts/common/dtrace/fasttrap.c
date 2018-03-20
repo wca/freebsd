@@ -63,7 +63,7 @@
 #ifndef illumos
 #include <sys/dtrace_bsd.h>
 #include <sys/eventhandler.h>
-#include <sys/rmlock.h>
+#include <sys/smr.h>
 #include <sys/sysent.h>
 #include <sys/sysctl.h>
 #include <sys/u8_textprep.h>
@@ -228,7 +228,6 @@ static void fasttrap_thread_dtor(void *, struct thread *);
 #define	FASTTRAP_PROCS_INDEX(pid) ((pid) & fasttrap_procs.fth_mask)
 
 #ifndef illumos
-struct rmlock fasttrap_tp_lock;
 static eventhandler_tag fasttrap_thread_dtor_tag;
 #endif
 
@@ -449,8 +448,7 @@ fasttrap_mod_barrier(uint64_t gen)
 		mutex_exit(&fasttrap_cpuc_pid_lock[i]);
 	}
 #else
-	rm_wlock(&fasttrap_tp_lock);
-	rm_wunlock(&fasttrap_tp_lock);
+	smr_synchronize_wait();
 #endif
 }
 
@@ -2518,8 +2516,6 @@ fasttrap_load(void)
 		mutex_init(&fasttrap_procs.fth_table[i].ftb_mtx,
 		    "processes bucket mtx", MUTEX_DEFAULT, NULL);
 
-	rm_init(&fasttrap_tp_lock, "fasttrap tracepoint");
-
 	/*
 	 * This event handler must run before kdtrace_thread_dtor() since it
 	 * accesses the thread's struct kdtrace_thread.
@@ -2651,7 +2647,6 @@ fasttrap_unload(void)
 #ifndef illumos
 	destroy_dev(fasttrap_cdev);
 	mutex_destroy(&fasttrap_count_mtx);
-	rm_destroy(&fasttrap_tp_lock);
 #endif
 
 	return (0);

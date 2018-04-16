@@ -35,19 +35,34 @@
 
 #include <ck_epoch.h>
 
+/*
+ * SMR subsystem users are expected to use the smr_* aliases.
+ */
 #define	SMR_CONTAINER CK_EPOCH_CONTAINER
+typedef ck_epoch_section_t smr_section_t;
 typedef ck_epoch_entry_t smr_entry_t;
+typedef ck_epoch_record_t smr_record_t;
 typedef ck_epoch_cb_t smr_cb_t;
 
 /**
  * @brief Begin a SMR read-side section.
  */
-void smr_begin(void);
+void smr_begin(smr_record_t *, smr_section_t *);
 
 /**
  * @brief End a SMR read-side section.
  */
-void smr_end(void);
+void smr_end(smr_record_t *, smr_section_t *);
+
+/**
+ * @brief Use common PCPU context to begin a SMR read-side section.
+ */
+void smr_pcpu_begin(smr_section_t *);
+
+/**
+ * @brief Use common PCPU context to end a SMR read-side section.
+ */
+void smr_pcpu_end(smr_section_t *);
 
 /**
  * @brief Call a reclamation callback once the object is no longer reachable.

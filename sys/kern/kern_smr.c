@@ -29,6 +29,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/malloc.h>
+#include <sys/kdb.h>
 #include <sys/kernel.h>
 #include <sys/sysctl.h>
 #include <sys/lock.h>
@@ -49,7 +50,8 @@
 
 struct smr_td_state;
 struct smr_pcpu_state {
-	ck_epoch_record_t sps_record;
+	smr_section_t sps_section;
+	smr_record_t sps_record;
 	TAILQ_HEAD(, smr_td_state) sps_head;
 	int sps_cpuid;
 };
@@ -86,7 +88,14 @@ sched_smr(void)
 }
 
 void
-smr_begin(void)
+smr_begin(smr_record_t *record, smr_section_t *section)
+{
+
+	ck_epoch_begin(record, section);
+}
+
+void
+smr_pcpu_begin(smr_section_t *section)
 {
 	struct smr_pcpu_state *sps;
 	struct smr_td_state *ts = &curthread->td_smr;
@@ -98,33 +107,47 @@ smr_begin(void)
 	sched_pin();
 	sps = &DPCPU_GET(smr_state);
 
+	if (section == NULL)
+		section = &sps->sps_section;
+
 	/*
 	 * Threads need to be registered here, so the epoch records can be
 	 * pcpu rather than per-thread.  Use a critical section to prevent
 	 * recursion within ck_epoch_begin().
 	 */
 	critical_enter();
-	ck_epoch_begin(&sps->sps_record, NULL);
+	smr_begin(&sps->sps_record, section);
 	ts->ts_recurse++;
 	if (ts->ts_recurse == 1)
 		TAILQ_INSERT_TAIL(&sps->sps_head, ts, ts_entry);
 	critical_exit();
+	kdb_backtrace();
 }
 
 void
-smr_end(void)
+smr_end(smr_record_t *record, smr_section_t *section)
+{
+
+	ck_epoch_end(record, section);
+}
+
+void
+smr_pcpu_end(smr_section_t *section)
 {
 	struct smr_pcpu_state *sps;
 	struct smr_td_state *ts = &curthread->td_smr;
 
 	sps = &DPCPU_GET(smr_state);
 
+	if (section == NULL)
+		section = &sps->sps_section;
+
 	/*
 	 * Use a critical section to prevent recursion within
 	 * ck_epoch_end().
 	 */
 	critical_enter();
-	ck_epoch_end(&sps->sps_record, NULL);
+	smr_end(&sps->sps_record, section);
 	ts->ts_recurse--;
 	if (ts->ts_recurse == 0)
 		TAILQ_REMOVE(&sps->sps_head, ts, ts_entry);
@@ -134,7 +157,7 @@ smr_end(void)
 }
 
 void
-smr_call(ck_epoch_entry_t *entry, ck_epoch_cb_t *fn)
+smr_call(smr_entry_t *entry, smr_cb_t *fn)
 {
 	struct smr_pcpu_state *sps;
 

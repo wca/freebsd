@@ -96,12 +96,12 @@ int
 pfil_run_hooks(struct pfil_head *ph, struct mbuf **mp, struct ifnet *ifp,
     int dir, struct inpcb *inp)
 {
-	struct rm_priotracker rmpt;
+	smr_section_t section;
 	struct packet_filter_hook *pfh;
 	struct mbuf *m = *mp;
 	int rv = 0;
 
-	pfil_rlock(ph, &rmpt);
+	smr_pcpu_begin(&section);
 	KASSERT(ph->ph_nhooks >= 0, ("Pfil hook count dropped < 0"));
 	for (pfh = pfil_chain_get(dir, ph); pfh != NULL;
 	     pfh = CK_STAILQ_NEXT(pfh, pfil_chain)) {
@@ -112,7 +112,7 @@ pfil_run_hooks(struct pfil_head *ph, struct mbuf **mp, struct ifnet *ifp,
 				break;
 		}
 	}
-	pfil_runlock(ph, &rmpt);
+	smr_pcpu_end(&section);
 	*mp = m;
 	return (rv);
 }
@@ -137,7 +137,7 @@ int
 pfil_try_rlock(struct pfil_head *ph, struct rm_priotracker *tracker)
 {
 
-	smr_begin();
+	smr_pcpu_begin(NULL);
 	return (1);
 }
 
@@ -148,7 +148,7 @@ void
 pfil_rlock(struct pfil_head *ph, struct rm_priotracker *tracker)
 {
 
-	smr_begin();
+	smr_pcpu_begin(NULL);
 }
 
 /*
@@ -158,7 +158,7 @@ void
 pfil_runlock(struct pfil_head *ph, struct rm_priotracker *tracker)
 {
 
-	smr_end();
+	smr_pcpu_end(NULL);
 }
 
 /*
@@ -235,18 +235,18 @@ int
 pfil_head_unregister(struct pfil_head *ph)
 {
 	struct packet_filter_hook *pfh, *pfnext;
+	smr_section_t section;
 
 	PFIL_HEADLIST_LOCK();
 	LIST_REMOVE(ph, ph_list);
 	PFIL_HEADLIST_UNLOCK();
-	smr_begin();
+	smr_pcpu_begin(&section);
 	CK_STAILQ_FOREACH_SAFE(pfh, &ph->ph_in, pfil_chain, pfnext)
 		smr_call(&pfh->pfil_smr, packet_filter_hook_reclaim);
 	CK_STAILQ_FOREACH_SAFE(pfh, &ph->ph_out, pfil_chain, pfnext)
 		smr_call(&pfh->pfil_smr, packet_filter_hook_reclaim);
-	smr_end();
+	smr_pcpu_end(&section);
 	PFIL_LOCK_DESTROY(ph);
-	//smr_barrier(SMR_BARRIER_T_PCPU);
 	return (0);
 }
 
@@ -337,8 +337,9 @@ int
 pfil_remove_hook(pfil_func_t func, void *arg, int flags, struct pfil_head *ph)
 {
 	int err = 0;
+	smr_section_t section;
 
-	smr_begin();
+	smr_pcpu_begin(&section);
 	PFIL_WLOCK(ph);
 	if (flags & PFIL_IN) {
 		err = pfil_chain_remove(&ph->ph_in, func, arg);
@@ -351,8 +352,7 @@ pfil_remove_hook(pfil_func_t func, void *arg, int flags, struct pfil_head *ph)
 			ph->ph_nhooks--;
 	}
 	PFIL_WUNLOCK(ph);
-	smr_end();
-	//smr_barrier(SMR_BARRIER_T_PCPU);
+	smr_pcpu_end(&section);
 	return (err);
 }
 

@@ -713,8 +713,9 @@ fasttrap_return_common(struct reg *rp, uintptr_t pc, pid_t pid,
 	pid_mtx = &cpu_core[CPU->cpu_id].cpuc_pid_lock;
 	mutex_enter(pid_mtx);
 #else
+	smr_section_t section;
 
-	smr_begin();
+	smr_pcpu_begin(&section);
 #endif
 	bucket = &fasttrap_tpoints.fth_table[FASTTRAP_TPOINTS_INDEX(pid, pc)];
 
@@ -733,7 +734,7 @@ fasttrap_return_common(struct reg *rp, uintptr_t pc, pid_t pid,
 #ifdef illumos
 		mutex_exit(pid_mtx);
 #else
-		smr_end();
+		smr_pcpu_end(&section);
 #endif
 		return;
 	}
@@ -758,7 +759,7 @@ fasttrap_return_common(struct reg *rp, uintptr_t pc, pid_t pid,
 #ifdef illumos
 	mutex_exit(pid_mtx);
 #else
-	smr_end();
+	smr_pcpu_end(&section);
 #endif
 }
 
@@ -970,6 +971,8 @@ fasttrap_pid_probe(struct trapframe *tf)
 	fasttrap_bucket_t *bucket;
 #ifdef illumos
 	kmutex_t *pid_mtx;
+#else
+	smr_section_t section;
 #endif
 	fasttrap_tracepoint_t *tp, tp_local;
 	pid_t pid;
@@ -1027,7 +1030,7 @@ fasttrap_pid_probe(struct trapframe *tf)
 	sx_sunlock(&proctree_lock);
 	pp = NULL;
 
-	smr_begin();
+	smr_pcpu_begin(&section);
 #endif
 
 	bucket = &fasttrap_tpoints.fth_table[FASTTRAP_TPOINTS_INDEX(pid, pc)];
@@ -1050,7 +1053,7 @@ fasttrap_pid_probe(struct trapframe *tf)
 #ifdef illumos
 		mutex_exit(pid_mtx);
 #else
-		smr_end();
+		smr_pcpu_end(&section);
 #endif
 		return (-1);
 	}
@@ -1175,7 +1178,7 @@ fasttrap_pid_probe(struct trapframe *tf)
 #ifdef illumos
 	mutex_exit(pid_mtx);
 #else
-	smr_end();
+	smr_pcpu_end(&section);
 #endif
 	tp = &tp_local;
 

@@ -37,6 +37,8 @@
 
 /*
  * SMR subsystem users are expected to use the smr_* aliases.
+ * These exist to represent generic handles in terms of visibility
+ * management, and do not necessarily need to be epoch-based.
  */
 #define	SMR_CONTAINER CK_EPOCH_CONTAINER
 typedef ck_epoch_section_t smr_section_t;
@@ -44,43 +46,66 @@ typedef ck_epoch_entry_t smr_entry_t;
 typedef ck_epoch_record_t smr_record_t;
 typedef ck_epoch_cb_t smr_cb_t;
 
-/**
- * @brief Begin a SMR read-side section.
- */
-void smr_begin(smr_record_t *, smr_section_t *);
+struct smr_domain;
+typedef struct smr_domain smr_domain_t;
 
 /**
- * @brief End a SMR read-side section.
+ * @brief Create a SMR visibility domain.
+ * All operations that use such handle are taken with respect to each other.
+ * By default, this performs blocking allocations.
+ * Returns the domain on success, NULL otherwise.
  */
-void smr_end(smr_record_t *, smr_section_t *);
+struct smr_domain *smr_domain_create(int flags);
 
 /**
- * @brief Use common PCPU context to begin a SMR read-side section.
+ * @brief Destroy a SMR visibility domain.
  */
-void smr_pcpu_begin(smr_section_t *);
+void smr_domain_destroy(struct smr_domain *);
 
 /**
- * @brief Use common PCPU context to end a SMR read-side section.
+ * @brief Obtain the global shared SMR visibility domain.
  */
-void smr_pcpu_end(smr_section_t *);
+struct smr_domain *smr_global_domain(void);
+
+/**
+ * @brief Set the notification callback for a SMR domain.
+ */
+typedef void smr_domain_notify_cb_t(struct smr_domain *);
+void smr_domain_set_notify(struct smr_domain *sd, smr_domain_notify_cb_t *cb);
+
+/**
+ * @brief Begin a SMR read-side section for a given domain.
+ */
+void smr_begin(smr_domain_t *, smr_section_t *);
+
+/**
+ * @brief Begin a non-preemptible SMR read-side section for a given domain.
+ */
+void smr_begin_nopreempt(smr_domain_t *, smr_section_t *);
+
+/**
+ * @brief End a SMR read-side section for a given domain.
+ */
+void smr_end(smr_domain_t *, smr_section_t *);
+
+/**
+ * @brief End a non-preemptible SMR read-side section for a given domain.
+ */
+void smr_end_nopreempt(smr_domain_t *, smr_section_t *);
 
 /**
  * @brief Call a reclamation callback once the object is no longer reachable.
  */
-void smr_call(smr_entry_t *, smr_cb_t *);
+void smr_call(smr_domain_t *, smr_entry_t *, smr_cb_t *);
 
 /**
  * @brief Wait until all currently-unreachable objects are reclaimed.
  */
-void smr_synchronize_wait(void);
+void smr_synchronize_wait(smr_domain_t *);
 
 /**
- * @brief Reclaim currently-unreachable objects for the given CPU.
- *
- * @param which		Barrier type to perform.
+ * @brief Reclaim currently-unreachable objects for the given domain.
  */
-#define	SMR_BARRIER_T_PCPU	(0)
-#define	SMR_BARRIER_T_ALL	(1)
-void smr_barrier(unsigned int which);
+void smr_barrier(smr_domain_t *);
 
 #endif /* _SYS_CALLOUT_H_ */

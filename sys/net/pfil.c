@@ -101,7 +101,7 @@ pfil_run_hooks(struct pfil_head *ph, struct mbuf **mp, struct ifnet *ifp,
 	struct mbuf *m = *mp;
 	int rv = 0;
 
-	smr_pcpu_begin(&section);
+	smr_begin(smr_global_domain(), &section);
 	KASSERT(ph->ph_nhooks >= 0, ("Pfil hook count dropped < 0"));
 	for (pfh = pfil_chain_get(dir, ph); pfh != NULL;
 	     pfh = CK_STAILQ_NEXT(pfh, pfil_chain)) {
@@ -112,7 +112,7 @@ pfil_run_hooks(struct pfil_head *ph, struct mbuf **mp, struct ifnet *ifp,
 				break;
 		}
 	}
-	smr_pcpu_end(&section);
+	smr_end(smr_global_domain(), &section);
 	*mp = m;
 	return (rv);
 }
@@ -137,7 +137,7 @@ int
 pfil_try_rlock(struct pfil_head *ph, struct rm_priotracker *tracker)
 {
 
-	smr_pcpu_begin(NULL);
+	smr_begin(smr_global_domain(), NULL);
 	return (1);
 }
 
@@ -148,7 +148,7 @@ void
 pfil_rlock(struct pfil_head *ph, struct rm_priotracker *tracker)
 {
 
-	smr_pcpu_begin(NULL);
+	smr_begin(smr_global_domain(), NULL);
 }
 
 /*
@@ -158,7 +158,7 @@ void
 pfil_runlock(struct pfil_head *ph, struct rm_priotracker *tracker)
 {
 
-	smr_pcpu_end(NULL);
+	smr_end(smr_global_domain(), NULL);
 }
 
 /*
@@ -240,12 +240,16 @@ pfil_head_unregister(struct pfil_head *ph)
 	PFIL_HEADLIST_LOCK();
 	LIST_REMOVE(ph, ph_list);
 	PFIL_HEADLIST_UNLOCK();
-	smr_pcpu_begin(&section);
-	CK_STAILQ_FOREACH_SAFE(pfh, &ph->ph_in, pfil_chain, pfnext)
-		smr_call(&pfh->pfil_smr, packet_filter_hook_reclaim);
-	CK_STAILQ_FOREACH_SAFE(pfh, &ph->ph_out, pfil_chain, pfnext)
-		smr_call(&pfh->pfil_smr, packet_filter_hook_reclaim);
-	smr_pcpu_end(&section);
+	smr_begin(smr_global_domain(), &section);
+	CK_STAILQ_FOREACH_SAFE(pfh, &ph->ph_in, pfil_chain, pfnext) {
+		smr_call(smr_global_domain(), &pfh->pfil_smr,
+		    packet_filter_hook_reclaim);
+	}
+	CK_STAILQ_FOREACH_SAFE(pfh, &ph->ph_out, pfil_chain, pfnext) {
+		smr_call(smr_global_domain(), &pfh->pfil_smr,
+		    packet_filter_hook_reclaim);
+	}
+	smr_end(smr_global_domain(), &section);
 	PFIL_LOCK_DESTROY(ph);
 	return (0);
 }
@@ -339,7 +343,7 @@ pfil_remove_hook(pfil_func_t func, void *arg, int flags, struct pfil_head *ph)
 	int err = 0;
 	smr_section_t section;
 
-	smr_pcpu_begin(&section);
+	smr_begin(smr_global_domain(), &section);
 	PFIL_WLOCK(ph);
 	if (flags & PFIL_IN) {
 		err = pfil_chain_remove(&ph->ph_in, func, arg);
@@ -352,7 +356,7 @@ pfil_remove_hook(pfil_func_t func, void *arg, int flags, struct pfil_head *ph)
 			ph->ph_nhooks--;
 	}
 	PFIL_WUNLOCK(ph);
-	smr_pcpu_end(&section);
+	smr_end(smr_global_domain(), &section);
 	return (err);
 }
 
@@ -395,7 +399,8 @@ pfil_chain_remove(pfil_chain_t *chain, pfil_func_t func, void *arg)
 		if (pfh->pfil_func == func && pfh->pfil_arg == arg) {
 			CK_STAILQ_REMOVE(chain, pfh,
 			    packet_filter_hook, pfil_chain);
-			smr_call(&pfh->pfil_smr, packet_filter_hook_reclaim);
+			smr_call(smr_global_domain(), &pfh->pfil_smr,
+			    packet_filter_hook_reclaim);
 			return (0);
 		}
 	return (ENOENT);

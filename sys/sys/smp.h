@@ -172,6 +172,8 @@ extern volatile int smp_started;
 
 extern cpuset_t all_cpus;
 extern cpuset_t cpuset_domain[MAXMEMDOM]; 	/* CPUs in each NUMA domain. */
+extern int cpuset_domcount[MAXMEMDOM];
+extern int cpuset_domoffsets[MAXMEMDOM];
 
 /*
  * Macro allowing us to determine whether a CPU is absent at any given

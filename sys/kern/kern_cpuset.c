@@ -126,6 +126,8 @@ SYSCTL_INT(_kern_sched, OID_AUTO, cpusetsize, CTLFLAG_RD | CTLFLAG_CAPRD,
 
 cpuset_t *cpuset_root;
 cpuset_t cpuset_domain[MAXMEMDOM];
+int cpuset_domcount[MAXMEMDOM];
+int cpuset_domoffsets[MAXMEMDOM];
 
 static int domainset_valid(const struct domainset *, const struct domainset *);
 
@@ -1455,7 +1457,7 @@ static void
 cpuset_init(void *arg)
 {
 	cpuset_t mask;
-	int i;
+	int dom, i;
 
 	mask = all_cpus;
 	if (cpuset_modify(cpuset_zero, &mask))
@@ -1470,10 +1472,31 @@ cpuset_init(void *arg)
 		if (!CPU_EMPTY(&cpuset_domain[i]))
 			goto domains_set;
 	CPU_COPY(&all_cpus, &cpuset_domain[0]);
+
 domains_set:
+	/* Initialize domain lookup tables. */
+	cpuset_domoffsets[0] = 0;
+	for (dom = 0; dom < vm_ndomains; dom++) {
+		cpuset_domcount[dom] = CPU_COUNT(&cpuset_domain[dom]);
+		if (dom > 0)
+			cpuset_domoffsets[dom] = cpuset_domoffsets[dom - 1] +
+			    cpuset_domcount[dom - 1];
+		printf("Domain %d: count %d offset %d\n",
+		    dom, cpuset_domcount[dom], cpuset_domoffsets[dom]);
+	}
+#ifdef INVARIANTS
+	for (dom = 0; dom < vm_ndomains; dom++) {
+		KASSERT(cpuset_domcount[dom],
+		    ("cpuset_domcount[%d] is zero", dom));
+		if (vm_ndomains > 1)
+			MPASS(cpuset_domcount[dom] < mp_ncpus);
+		else
+			MPASS(cpuset_domcount[dom] <= mp_ncpus);
+	}
+#endif
 	return;
 }
-SYSINIT(cpuset, SI_SUB_SMP, SI_ORDER_ANY, cpuset_init, NULL);
+SYSINIT(cpuset, SI_SUB_CPUSET, SI_ORDER_ANY, cpuset_init, NULL);
 
 #ifndef _SYS_SYSPROTO_H_
 struct cpuset_args {

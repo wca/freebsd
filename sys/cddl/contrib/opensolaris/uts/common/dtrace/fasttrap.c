@@ -448,7 +448,7 @@ fasttrap_mod_barrier(uint64_t gen)
 		mutex_exit(&fasttrap_cpuc_pid_lock[i]);
 	}
 #else
-	smr_synchronize_wait();
+	smr_synchronize_wait(smr_global_domain());
 #endif
 }
 

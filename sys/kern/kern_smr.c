@@ -35,51 +35,100 @@
 #include <sys/lock.h>
 #include <sys/mutex.h>
 #include <sys/kthread.h>
-
+#include <sys/counter.h>
+#include <sys/param.h>
 #include <sys/types.h>
 #include <sys/proc.h>
 #include <sys/queue.h>
 #include <sys/sched.h>
 #include <sys/smp.h>
 #include <sys/smr.h>
+#include <sys/turnstile.h>
+#include <machine/vmparam.h>
+#include <vm/vm.h>
+#include <vm/vm_extern.h>
+#include <vm/vm_kern.h>
+#include <vm/vm_object.h>
+#include <vm/vm_phys.h>
 
 #include <ck_epoch.h>
 
 #define container_of(p, stype, field) \
 	((stype *)(((uint8_t *)(p)) - offsetof(stype, field)))
 
+static MALLOC_DEFINE(M_SMR, "smr", "smr");
+
 struct smr_td_state;
 struct smr_pcpu_state {
-	smr_section_t sps_section;
 	smr_record_t sps_record;
-	TAILQ_HEAD(, smr_td_state) sps_head;
-	int sps_cpuid;
+	unsigned int sps_critnest;
+	unsigned int sps_waiters;
+} __aligned(CACHE_LINE_SIZE);
+
+struct smr_domain {
+	struct ck_epoch sd_epoch;
+	struct smr_pcpu_state *sd_dom[MAXMEMDOM];
+	smr_domain_notify_cb_t *sd_notify_cb;
+	struct smr_pcpu_state *sd_pcpu[0];
 };
 
-static ck_epoch_t kern_epoch;
-static DPCPU_DEFINE(struct smr_pcpu_state, smr_state);
+static struct smr_domain *smr_global;
+static __read_mostly struct lock_object smr_ts = {
+	.lo_name = "smrts",
+};
 
 static struct cv smr_cv;
 static struct mtx smr_mtx;
-static struct proc *smrproc;
+static struct proc *smr_global_proc;
 static void sched_smr(void);
 static struct kproc_desc smr_kp = {
 	"smr_gc",
 	sched_smr,
-	&smrproc,
+	&smr_global_proc,
 };
+
+/*
+ * Sysctls for visibility.
+ *
+ * TODO Improve by including per-domain state, DTrace probes, etc.
+ */
+SYSCTL_NODE(_kern, OID_AUTO, smr, CTLFLAG_RW, 0, "smr information");
+SYSCTL_NODE(_kern_smr, OID_AUTO, stats, CTLFLAG_RW, 0, "smr stats");
+static counter_u64_t wait_count;
+SYSCTL_COUNTER_U64(_kern_smr_stats, OID_AUTO, preemption_waits, CTLFLAG_RW,
+    &wait_count, "# of times waited due to preemption");
+static counter_u64_t yield_count;
+SYSCTL_COUNTER_U64(_kern_smr_stats, OID_AUTO, yields, CTLFLAG_RW,
+    &yield_count, "# of times yielded to other cpu");
+
+struct smr_domain *
+smr_global_domain(void)
+{
+
+	return smr_global;
+}
+
+static void
+smr_global_notify(struct smr_domain *sd)
+{
+
+	/* Let the GC thread know there's work to do. */
+	cv_broadcast(&smr_cv);
+}
 
 static void
 sched_smr(void)
 {
 	struct timeval tv;
+	struct smr_domain *sd;
 
 	/* Wait at most 5 seconds between synchronizes. */
 	tv.tv_sec = 5;
 	tv.tv_usec = 0;
 
+	sd = smr_global_domain();
 	for (;;) {
-		smr_barrier(SMR_BARRIER_T_ALL);
+		smr_barrier(sd);
 
 		mtx_lock(&smr_mtx);
 		(void) cv_timedwait(&smr_cv, &smr_mtx, tvtohz(&tv));
@@ -88,86 +137,89 @@ sched_smr(void)
 }
 
 void
-smr_begin(smr_record_t *record, smr_section_t *section)
-{
-
-	ck_epoch_begin(record, section);
-}
-
-void
-smr_pcpu_begin(smr_section_t *section)
+smr_begin(smr_domain_t *sd, smr_section_t *section)
 {
 	struct smr_pcpu_state *sps;
-	struct smr_td_state *ts = &curthread->td_smr;
 
-	/*
-	 * Pin thread to current CPU, so the unlock gets the same per-CPU
-	 * epoch record.
-	 */
+	critical_enter();
 	sched_pin();
-	sps = &DPCPU_GET(smr_state);
-
-	if (section == NULL)
-		section = &sps->sps_section;
-
-	/*
-	 * Threads need to be registered here, so the epoch records can be
-	 * pcpu rather than per-thread.  Use a critical section to prevent
-	 * recursion within ck_epoch_begin().
-	 */
-	critical_enter();
-	smr_begin(&sps->sps_record, section);
-	ts->ts_recurse++;
-	if (ts->ts_recurse == 1)
-		TAILQ_INSERT_TAIL(&sps->sps_head, ts, ts_entry);
+	sps = sd->sd_pcpu[curcpu];
+	sps->sps_critnest++;
+	ck_epoch_begin(&sps->sps_record, section);
 	critical_exit();
-	kdb_backtrace();
 }
 
 void
-smr_end(smr_record_t *record, smr_section_t *section)
-{
-
-	ck_epoch_end(record, section);
-}
-
-void
-smr_pcpu_end(smr_section_t *section)
+smr_begin_nopreempt(smr_domain_t *sd, smr_section_t *section)
 {
 	struct smr_pcpu_state *sps;
-	struct smr_td_state *ts = &curthread->td_smr;
 
-	sps = &DPCPU_GET(smr_state);
-
-	if (section == NULL)
-		section = &sps->sps_section;
-
-	/*
-	 * Use a critical section to prevent recursion within
-	 * ck_epoch_end().
-	 */
 	critical_enter();
-	smr_end(&sps->sps_record, section);
-	ts->ts_recurse--;
-	if (ts->ts_recurse == 0)
-		TAILQ_REMOVE(&sps->sps_head, ts, ts_entry);
-	critical_exit();
+	sps = sd->sd_pcpu[curcpu];
+	ck_epoch_begin(&sps->sps_record, section);
+}
 
-	sched_unpin();
+static void
+smr_turnstile_exit(struct smr_pcpu_state *sps)
+{
+	struct turnstile *ts;
+
+	MPASS(curthread->td_critnest);
+	if (__predict_true(sps->sps_waiters == 0))
+		return;
+
+	turnstile_chain_lock(&smr_ts);
+	ts = turnstile_lookup(&smr_ts);
+	if (ts != NULL) {
+		turnstile_broadcast(ts, TS_SHARED_QUEUE);
+		turnstile_unpend(ts, TS_SHARED_LOCK);
+	}
+	turnstile_chain_unlock(&smr_ts);
 }
 
 void
-smr_call(smr_entry_t *entry, smr_cb_t *fn)
+smr_end(smr_domain_t *sd, smr_section_t *section)
+{
+	struct smr_pcpu_state *sps;
+	bool done;
+
+	critical_enter();
+	sps = sd->sd_pcpu[curcpu];
+	MPASS(sps->sps_critnest);
+	sched_unpin();
+	done = ck_epoch_end(&sps->sps_record, section);
+	sps->sps_critnest--;
+	smr_turnstile_exit(sps);
+	critical_exit();
+
+	if (done && sd->sd_notify_cb != NULL)
+		sd->sd_notify_cb(sd);
+}
+
+void
+smr_end_nopreempt(smr_domain_t *sd, smr_section_t *section)
+{
+	struct smr_pcpu_state *sps;
+	bool done;
+
+	MPASS(curthread->td_critnest);
+	sps = sd->sd_pcpu[curcpu];
+	done = ck_epoch_end(&sps->sps_record, section);
+	critical_exit();
+
+	if (done && sd->sd_notify_cb != NULL)
+		sd->sd_notify_cb(sd);
+}
+
+void
+smr_call(smr_domain_t *sd, smr_entry_t *entry, smr_cb_t *fn)
 {
 	struct smr_pcpu_state *sps;
 
 	/* This call requires pcpu association. */
 	KASSERT(curthread->td_pinned > 0, ("curthread not pinned"));
-	sps = &DPCPU_GET(smr_state);
+	sps = sd->sd_pcpu[curcpu];
 	ck_epoch_call(&sps->sps_record, entry, fn);
-
-	/* Wakeup the SMR GC thread. */
-	cv_broadcast(&smr_cv);
 }
 
 static void
@@ -175,109 +227,45 @@ smr_synchronize_cb(ck_epoch_t *epoch __unused, ck_epoch_record_t *record,
     void *arg __unused)
 {
 	struct smr_pcpu_state *sps;
-	struct thread *td;
-	struct smr_td_state *ts;
+	struct turnstile *ts;
+	int yielded;
 
 	sps = container_of(record, struct smr_pcpu_state, sps_record);
-
-	/* Check if blocked on the current CPU */
-	if (sps->sps_cpuid == PCPU_GET(cpuid)) {
-		bool is_sleeping = false;
-		u_char prio = 0;
-
-		/*
-		 * Find the lowest priority or sleeping thread which
-		 * is blocking synchronization on this CPU core. All
-		 * the threads in the queue are CPU-pinned and cannot
-		 * go anywhere while the current thread is locked.
-		 */
-		TAILQ_FOREACH(ts, &sps->sps_head, ts_entry) {
-			td = container_of(ts, struct thread, td_smr);
-			if (td->td_priority > prio)
-				prio = td->td_priority;
-			is_sleeping |= (td->td_inhibitors != 0);
-		}
-
-		if (is_sleeping) {
-			thread_unlock(curthread);
-			pause("W", 1);
-			thread_lock(curthread);
-		} else {
-			/* set new thread priority */
-			sched_prio(curthread, prio);
-			/* task switch */
-			mi_switch(SW_VOL | SWT_RELINQUISH, NULL);
-
-			/*
-			 * Release the thread lock while yielding to
-			 * allow other threads to acquire the lock
-			 * pointed to by TDQ_LOCKPTR(curthread). Else a
-			 * deadlock like situation might happen.
-			 */
-			thread_unlock(curthread);
-			thread_lock(curthread);
-		}
-	} else {
-		/*
-		 * To avoid spinning move execution to the other CPU
-		 * which is blocking synchronization. Set highest
-		 * thread priority so that code gets run. The thread
-		 * priority will be restored later.
-		 */
-		sched_prio(curthread, 0);
-		sched_bind(curthread, sps->sps_cpuid);
+	while (ck_pr_load_uint(&sps->sps_critnest)) {
+		counter_u64_add(wait_count, 1);
+		ts = turnstile_trywait(&smr_ts);
+		turnstile_wait(ts, NULL, TS_SHARED_QUEUE);
+		yielded = 1;
+	}
+	if (!yielded) {
+		counter_u64_add(yield_count, 1);
+		kern_yield(PRI_UNCHANGED);
 	}
 }
 
 void
-smr_synchronize_wait(void)
+smr_synchronize_wait(struct smr_domain *sd)
 {
-	struct thread *td;
-	int was_bound;
-	int old_cpu;
-	int old_pinned;
-	u_char old_prio;
+	struct smr_pcpu_state *sps;
+	struct turnstile *ts;
 
-	WITNESS_WARN(WARN_GIANTOK | WARN_SLEEPOK, NULL,
-	    "smr_synchronize_wait() can sleep");
+	critical_enter();
+	sched_pin();
+	sps = sd->sd_pcpu[curcpu];
+	ck_pr_inc_uint(&sps->sps_waiters);
+	critical_exit();
 
-	td = curthread;
-
-	DROP_GIANT();
-
-	/*
-	 * Synchronizing might change the CPU core this function is
-	 * running on. Save current values:
-	 */
-	thread_lock(td);
-
-	old_cpu = PCPU_GET(cpuid);
-	old_pinned = td->td_pinned;
-	old_prio = td->td_priority;
-	was_bound = sched_is_bound(td);
-	sched_unbind(td);
-	td->td_pinned = 0;
-	sched_bind(td, old_cpu);
-
-	ck_epoch_synchronize_wait(&kern_epoch, smr_synchronize_cb, NULL);
-
-	/* restore CPU binding, if applicable */
-	if (was_bound != 0) {
-		sched_bind(td, old_cpu);
-	} else {
-		/* get thread back to initial CPU, if applicable */
-		if (old_pinned != 0)
-			sched_bind(td, old_cpu);
-		sched_unbind(td);
+	while (ck_pr_load_uint(&sps->sps_critnest))  {
+		counter_u64_add(wait_count, 1);
+		ts = turnstile_trywait(&smr_ts);
+		turnstile_wait(ts, NULL, TS_SHARED_QUEUE);
 	}
-	/* restore pinned after bind */
-	td->td_pinned = old_pinned;
+	ck_epoch_synchronize_wait(&sd->sd_epoch, smr_synchronize_cb, NULL);
 
-	/* restore thread priority */
-	sched_prio(td, old_prio);
-	thread_unlock(td);
-
-	PICKUP_GIANT();
+	critical_enter();
+	sched_unpin();
+	ck_pr_dec_uint(&sps->sps_waiters);
+	critical_exit();
 }
 
 static void
@@ -305,86 +293,164 @@ static void
 epoch_stack_dispatch(ck_stack_t *pending)
 {
 	ck_stack_entry_t *cursor, *next;
+	unsigned int reclaims = 0;
 
 	CK_STACK_FOREACH_SAFE(pending, cursor, next) {
 		struct ck_epoch_entry *entry = ck_epoch_entry_container(cursor);
 
 		next = CK_STACK_NEXT(cursor);
 		entry->function(entry);
+		reclaims++;
 	}
 
 	return;
 }
 
 static void
+stack_batch_push_upmc(ck_stack_t *target, ck_stack_entry_t *head,
+    unsigned int *n_entries)
+{
+	ck_stack_entry_t *last, *stack, *next;
+
+	last = NULL;
+	*n_entries = 0;
+	for (next = head; next != NULL; next = CK_STACK_NEXT(next), (*n_entries)++)
+		last = next;
+
+	stack = ck_pr_load_ptr(&target->head);
+	last->next = stack;
+	ck_pr_fence_store();
+
+	while (ck_pr_cas_ptr_value(&target->head, stack, head, &stack) == false) {
+		last->next = stack;
+		ck_pr_fence_store();
+	}
+}
+
+static unsigned int
 epoch_stack_pop(struct ck_epoch_record *record, ck_stack_t *pending)
 {
-	unsigned int epoch, reclaims;
-	ck_stack_entry_t *e_pending, *cursor;
+	unsigned int epoch, reclaims, total;
+	ck_stack_entry_t *cursor;
 
-	for (epoch = 0; epoch < CK_EPOCH_LENGTH; epoch++) {
+	for (total = epoch = 0; epoch < CK_EPOCH_LENGTH; epoch++) {
 		reclaims = 0;
-		e_pending = ck_stack_batch_pop_upmc(&record->pending[epoch]);
-		if (e_pending == NULL)
+		cursor = ck_stack_batch_pop_upmc(&record->pending[epoch]);
+		if (cursor == NULL)
 			continue;
-		for (cursor = e_pending; cursor != NULL;
-		    cursor = CK_STACK_NEXT(cursor), reclaims++);
+		stack_batch_push_upmc(pending, cursor, &reclaims);
+		total += reclaims;
 		epoch_record_reclaims(record, reclaims);
-		ck_stack_push_upmc(pending, e_pending);
 	}
-	return;
+	return total;
 }
 
 void
-smr_barrier(unsigned int which)
+smr_barrier(smr_domain_t *sd)
 {
 	struct smr_pcpu_state *sps;
 	ck_stack_t pending;
-	int i;
+	int i, reclaims;
 
 	/*
 	 * Pop off every pending deferred object requested, synchronize,
 	 * then dispatch all seen deferrals.
 	 */
 	ck_stack_init(&pending);
-	switch (which) {
-	case SMR_BARRIER_T_PCPU:
-		sps = &DPCPU_GET(smr_state);
-		epoch_stack_pop(&sps->sps_record, &pending);
-		break;
-	case SMR_BARRIER_T_ALL:
-		CPU_FOREACH(i) {
-			sps = &DPCPU_ID_GET(i, smr_state);
-			epoch_stack_pop(&sps->sps_record, &pending);
-		}
-		break;
-	default:
-		panic("unhandled smr_barrier which case");
-		/* NOTREACHED */
+	CPU_FOREACH(i) {
+		sps = sd->sd_pcpu[i];
+		reclaims = epoch_stack_pop(&sps->sps_record, &pending);
 	}
 
-	smr_synchronize_wait();
+	smr_synchronize_wait(sd);
 
 	epoch_stack_dispatch(&pending);
+}
+
+void
+smr_domain_set_notify(struct smr_domain *sd, smr_domain_notify_cb_t *cb)
+{
+
+	sd->sd_notify_cb = cb;
+}
+
+struct smr_domain *
+smr_domain_create(int flags)
+{
+	struct smr_domain *sd;
+	struct smr_pcpu_state *sps = NULL;
+	int dom, i;
+
+	flags |= M_ZERO;
+	if ((flags & M_NOWAIT) == 0)
+		flags |= M_WAITOK;
+
+	sd = malloc(sizeof(*sd) + mp_ncpus * sizeof(void *), M_SMR, flags);
+	if (sd == NULL)
+		return NULL;
+
+	ck_epoch_init(&sd->sd_epoch);
+	for (dom = 0; dom < vm_ndomains; dom++) {
+		sps = malloc_domain(sizeof(*sps) * cpuset_domcount[dom],
+		    M_SMR, dom, flags);
+		if (sps == NULL)
+			break;
+		sd->sd_dom[dom] = sps;
+	}
+
+	if (sps == NULL) {
+		for (dom = 0; dom < vm_ndomains; dom++)
+			free(sd->sd_dom[dom], M_SMR);
+		free(sd, M_SMR);
+		return (NULL);
+	}
+
+	for (dom = 0; dom < vm_ndomains; dom++) {
+		sps = sd->sd_dom[dom];
+		for (i = 0; i < cpuset_domcount[dom]; i++, sps++) {
+			sd->sd_pcpu[cpuset_domoffsets[dom] + i] = sps;
+			ck_epoch_register(&sd->sd_epoch, &sps->sps_record, NULL);
+		}
+	}
+	return (sd);
+}
+
+void
+smr_domain_destroy(struct smr_domain *sd)
+{
+	int domain;
+#ifdef INVARIANTS
+	struct smr_pcpu_state *sps;
+	int cpu;
+	CPU_FOREACH(cpu) {
+		sps = sd->sd_pcpu[cpu];
+		MPASS(ck_pr_load_uint(&sps->sps_critnest) == 0);
+	}
+#endif
+
+	for (domain = 0; domain < vm_ndomains; domain++)
+		free(sd->sd_dom[domain], M_SMR);
+	free(sd, M_SMR);
 }
 
 static void
 smr_init(void *arg __unused)
 {
-	int i;
-	struct smr_pcpu_state *sps;
 
-	ck_epoch_init(&kern_epoch);
+	smr_global = smr_domain_create(0);
+	MPASS(smr_global != NULL);
+	smr_domain_set_notify(smr_global, smr_global_notify);
 	mtx_init(&smr_mtx, "SMR mtx", NULL, MTX_DEF);
 	cv_init(&smr_cv, "smr");
+	wait_count = counter_u64_alloc(M_WAITOK);
+	yield_count = counter_u64_alloc(M_WAITOK);
+}
+SYSINIT(smr, SI_SUB_CPUSET + 1, SI_ORDER_ANY, smr_init, NULL);
 
-	CPU_FOREACH(i) {
-		sps = &DPCPU_ID_GET(i, smr_state);
-		sps->sps_cpuid = i;
-		TAILQ_INIT(&sps->sps_head);
-		ck_epoch_register(&kern_epoch, &sps->sps_record, NULL);
-	}
+static void
+smr_finalize(void *arg __unused)
+{
 
 	kproc_start(&smr_kp);
 }
-SYSINIT(smr, SI_SUB_KTHREAD_INIT, SI_ORDER_ANY, smr_init, NULL);
+SYSINIT(smr_finalize, SI_SUB_KTHREAD_IDLE, SI_ORDER_ANY, smr_finalize, NULL);

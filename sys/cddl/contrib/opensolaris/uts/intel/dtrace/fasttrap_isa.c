@@ -53,6 +53,7 @@
 #include <machine/segments.h>
 #include <machine/reg.h>
 #include <machine/pcb.h>
+#include <machine/trap.h>
 #endif
 #include <sys/sysmacros.h>
 #ifdef illumos

@@ -42,6 +42,7 @@ __FBSDID("$FreeBSD$");
 #include <machine/cpufunc.h>
 #include <machine/psl.h>
 #include <machine/md_var.h>
+#include <machine/reg.h>
 #include <machine/specialreg.h>
 #include <machine/smp.h>
 #include <machine/vmm.h>
@@ -507,8 +508,8 @@ vmcb_init(struct svm_softc *sc, int vcpu, uint64_t iopm_base_pa,
 	    PAT_VALUE(7, PAT_UNCACHEABLE);
 
 	/* Set up DR6/7 to power-on state */
-	state->dr6 = 0xffff0ff0;
-	state->dr7 = 0x400;
+	state->dr6 = DBREG_DR6_RESERVED1;
+	state->dr7 = DBREG_DR7_RESERVED1;
 }
 
 /*
@@ -2012,6 +2013,12 @@ svm_vmrun(void *arg, int vcpu, register_t rip, pmap_t pmap,
 		if (vcpu_should_yield(vm, vcpu)) {
 			enable_gintr();
 			vm_exit_astpending(vm, vcpu, state->rip);
+			break;
+		}
+
+		if (vcpu_debugged(vm, vcpu)) {
+			enable_gintr();
+			vm_exit_debug(vm, vcpu, state->rip);
 			break;
 		}
 

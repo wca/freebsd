@@ -107,6 +107,42 @@ typedef enum override_states {
 	DR_OVERRIDDEN
 } override_states_t;
 
+typedef struct dbuf_dirty_indirect_record {
+	kmutex_t dr_mtx;	/* Protects the children. */
+	list_t dr_children;	/* List of our dirty children. */
+} dbuf_dirty_indirect_record_t;
+
+typedef struct dbuf_dirty_range {
+	list_node_t write_range_link;
+	int start;
+	int end;
+	int size;
+} dbuf_dirty_range_t;
+
+typedef struct dbuf_dirty_leaf_record {
+	/*
+	 * dr_data is set when we dirty the buffer so that we can retain the
+	 * pointer even if it gets COW'd in a subsequent transaction group.
+	 */
+	arc_buf_t *dr_data;
+	blkptr_t dr_overridden_by;
+	override_states_t dr_override_state;
+	uint8_t dr_copies;
+
+	/*
+	 * List of the ranges that dr_data's contents are valid for.
+	 * Used when not all of dr_data is valid, as it may be if writes
+	 * only cover part of it, and no read has filled in the gaps yet.
+	 */
+	list_t write_ranges;
+	boolean_t dr_nopwrite;
+} dbuf_dirty_leaf_record_t;
+
+typedef union dbuf_dirty_record_types {
+	struct dbuf_dirty_indirect_record di;
+	struct dbuf_dirty_leaf_record dl;
+} dbuf_dirty_record_types_t;
+
 typedef struct dbuf_dirty_record {
 	/* link on our parents dirty list */
 	list_node_t dr_dirty_node;
@@ -120,8 +156,8 @@ typedef struct dbuf_dirty_record {
 	/* pointer back to our dbuf */
 	struct dmu_buf_impl *dr_dbuf;
 
-	/* pointer to next dirty record */
-	struct dbuf_dirty_record *dr_next;
+	/** list link for dbuf dirty records */
+	list_node_t db_dirty_record_link;
 
 	/* pointer to parent dirty record */
 	struct dbuf_dirty_record *dr_parent;
@@ -132,29 +168,7 @@ typedef struct dbuf_dirty_record {
 	/* A copy of the bp that points to us */
 	blkptr_t dr_bp_copy;
 
-	union dirty_types {
-		struct dirty_indirect {
-
-			/* protect access to list */
-			kmutex_t dr_mtx;
-
-			/* Our list of dirty children */
-			list_t dr_children;
-		} di;
-		struct dirty_leaf {
-
-			/*
-			 * dr_data is set when we dirty the buffer
-			 * so that we can retain the pointer even if it
-			 * gets COW'd in a subsequent transaction group.
-			 */
-			arc_buf_t *dr_data;
-			blkptr_t dr_overridden_by;
-			override_states_t dr_override_state;
-			uint8_t dr_copies;
-			boolean_t dr_nopwrite;
-		} dl;
-	} dt;
+	union dbuf_dirty_record_types dt;
 } dbuf_dirty_record_t;
 
 typedef struct dmu_buf_impl {
@@ -227,8 +241,8 @@ typedef struct dmu_buf_impl {
 	kcondvar_t db_changed;
 	dbuf_dirty_record_t *db_data_pending;
 
-	/* pointer to most recent dirty record for this buffer */
-	dbuf_dirty_record_t *db_last_dirty;
+	/** List of dirty records for the buffer sorted newest to oldest. */
+	list_t db_dirty_records;
 
 	/*
 	 * Our link on the owner dnodes's dn_dbufs list.

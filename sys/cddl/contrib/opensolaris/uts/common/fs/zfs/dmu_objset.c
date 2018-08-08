@@ -1622,9 +1622,11 @@ dmu_objset_userquota_find_data(dmu_buf_impl_t *db, dmu_tx_t *tx)
 	if (db->db_dirtycnt == 0)
 		return (db->db.db_data);  /* Nothing is changing */
 
-	for (drp = &db->db_last_dirty; (dr = *drp) != NULL; drp = &dr->dr_next)
+	for (dr = list_head(&db->db_dirty_records); dr != NULL;
+	    dr = list_next(&db->db_dirty_records, dr)) {
 		if (dr->dr_txg == tx->tx_txg)
 			break;
+	}
 
 	if (dr == NULL) {
 		data = NULL;
